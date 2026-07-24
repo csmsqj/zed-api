@@ -4,7 +4,17 @@
 
 三种协议（Responses / Chat Completions / Messages）都支持流式和工具调用，自带多账号调度、额度查看和中文 Web 管理页。
 
-> 服务固定监听 `http://127.0.0.1:8001`，没有鉴权，只在本机用，别暴露公网。
+> 服务固定监听 `http://127.0.0.1:8001`，只在本机用，别暴露公网。
+
+## 效果
+
+Codex CLI / TUI：
+
+![Codex CLI](docs/codex-cli.png)
+
+Codex 桌面端（5.6 Sol，极高档位）：
+
+![Codex Desktop](docs/codex-desktop.png)
 
 ## 能做什么
 
@@ -33,8 +43,6 @@ GPT-5.6 思考档位：`none / low / medium / high / xhigh`，不传默认 `xhig
 ```
 
 管理页：<http://127.0.0.1:8001>
-
-`accounts.json` 存的是登录凭据，已经在 `.gitignore` 里，别提交、别截图。
 
 健康检查：
 
@@ -132,8 +140,8 @@ zig build -Doptimize=ReleaseSafe                # 产物：zig-out\bin\zed2api.e
 
 ## 已知限制
 
-- 只绑 `127.0.0.1`、无鉴权，别做端口转发。
-- Zed 是上游服务，模型名、请求头、账号策略说变就变；升级 Zed 客户端后核对一下 `src/proxy.zig` 的版本和请求头。
+- 服务本身无鉴权，默认只监听 `127.0.0.1`。想通过中转/反代分享给别人用的话，务必自己在前面加一层鉴权，否则等于把账号额度裸奔出去。
+- 请求格式完全按 Zed 官方客户端实现，但上游随时可能改协议或触发风控，不保证持续可用。
 - `count_tokens` 是兼容桩，别拿来精确计费。
 - 有些 Zed 套餐不公开数值额度，管理页只能显示"未公开"，精确金额去 Zed 官网看。
 - 一次调度最多尝试 64 个账号。
