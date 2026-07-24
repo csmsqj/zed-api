@@ -1,0 +1,13 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8001",
+    "ANTHROPIC_AUTH_TOKEN": "dummy",
+    "ANTHROPIC_MODEL": "gpt-5.6-sol",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.6-sol",
+    "CLAUDE_CODE_EFFORT_LEVEL": "xhigh",
+    "NO_PROXY": "127.0.0.1,localhost",
+    "no_proxy": "127.0.0.1,localhost"
+  },
+  "model": "gpt-5.6-sol",
+  "effortLevel": "xhigh"
+}

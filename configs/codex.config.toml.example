@@ -1,0 +1,13 @@
+# 合并到用户级 %USERPROFILE%\.codex\config.toml。
+# 项目级 .codex/config.toml 不应放 model_provider/model_providers。
+model_provider = "zed_local"
+# 可选：gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna。
+model = "gpt-5.6-sol"
+# 默认 xhigh；Codex 中改成 none/low/medium/high/xhigh 会原样转发。
+model_reasoning_effort = "xhigh"
+
+[model_providers.zed_local]
+name = "Zed Local"
+base_url = "http://127.0.0.1:8001/v1"
+wire_api = "responses"
+requires_openai_auth = false

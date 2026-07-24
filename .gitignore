@@ -1,0 +1,43 @@
+# Zig 构建缓存与产物
+.zig-cache/
+zig-out/
+zig-out-*/
+
+# 本地账号、活动账号和环境变量都可能包含凭据
+accounts.json
+github_accounts.json
+active_account.txt
+.env
+.env.*
+!.env.example
+configs/*.local.*
+
+# 编译产物与本地回滚副本
+*.exe
+*.pdb
+*.dll
+*.dmp
+*.bak
+
+# 调试请求与临时诊断文件
+zed2api_*.json
+*.har
+*.tmp
+*.temp
+debug_*.png
+_debug/
+
+# Web UI 依赖与生成文件
+webui/node_modules/
+webui/dist/
+
+# 运行时日志和进程文件
+logs/
+*.log
+*.pid
+
+# 常见本地编辑器文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
