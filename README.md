@@ -148,7 +148,7 @@ zig build -Doptimize=ReleaseSafe                # 产物：zig-out\bin\zed2api.e
 
 ## License
 
-MIT（早期思路参考 [yukmakoto/zed2api](https://github.com/yukmakoto/zed2api)；本仓库为重写版。）
+MIT。早期思路参考了 [yukmakoto/zed2api](https://github.com/yukmakoto/zed2api)，但本仓库已基本重写：请求格式对齐官方客户端、新增 Codex / Claude Code / OpenCode 三客户端适配、多账号调度、全新 Web UI，并修复了原实现的大量问题。
 
 ## 友链
 
