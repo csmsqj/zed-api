@@ -1153,6 +1153,11 @@ fn writeNativeResponsesInput(w: *std.io.Writer, input: std.json.Value) !void {
                 first = false;
                 if (isResponsesMessageItem(item)) {
                     try writeCanonicalResponsesMessage(w, item);
+                } else if (item == .object) {
+                    // Codex resends history items (e.g. reasoning) with
+                    // explicit nulls ("content":null); Zed's parser rejects
+                    // null where it expects an array, so omit those fields.
+                    try writeObjectSkippingNulls(w, item);
                 } else {
                     try std.json.Stringify.value(item, .{}, w);
                 }
@@ -1161,6 +1166,21 @@ fn writeNativeResponsesInput(w: *std.io.Writer, input: std.json.Value) !void {
         },
         else => try std.json.Stringify.value(input, .{}, w),
     }
+}
+
+fn writeObjectSkippingNulls(w: *std.io.Writer, item: std.json.Value) !void {
+    try w.writeAll("{");
+    var first = true;
+    var it = item.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* == .null) continue;
+        if (!first) try w.writeAll(",");
+        first = false;
+        try std.json.Stringify.encodeJsonString(entry.key_ptr.*, .{}, w);
+        try w.writeAll(":");
+        try std.json.Stringify.value(entry.value_ptr.*, .{}, w);
+    }
+    try w.writeAll("}");
 }
 
 fn isResponsesMessageItem(item: std.json.Value) bool {
