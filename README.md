@@ -8,9 +8,9 @@
 
 ## 效果
 
-Codex CLI / TUI：
+Claude Code：
 
-![Codex CLI](docs/codex-cli.png)
+![Claude Code](docs/claude-code.png)
 
 Codex 桌面端（5.6 Sol，极高档位）：
 
@@ -148,7 +148,7 @@ zig build -Doptimize=ReleaseSafe                # 产物：zig-out\bin\zed2api.e
 
 ## License
 
-MIT。早期思路参考了 [yukmakoto/zed2api](https://github.com/yukmakoto/zed2api)，但本仓库已基本重写：请求格式对齐官方客户端、新增 Codex / Claude Code / OpenCode 三客户端适配、多账号调度、全新 Web UI，并修复了原实现的问题。
+MIT。早期思路参考了 [yukmakoto/zed2api](https://github.com/yukmakoto/zed2api)，但本仓库已基本完全重写：请求格式对齐官方客户端、新增 Codex / Claude Code / OpenCode 三客户端适配、多账号调度、全新 Web UI，并修复了原实现的问题。
 
 ## 友链
 
