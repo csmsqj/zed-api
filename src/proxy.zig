@@ -24,10 +24,9 @@ pub const CLIENT_SUPPORTS_STREAM_ENDED_HEADER = "x-zed-client-supports-stream-en
 
 // User-Agent the real Zed client sets as a global default on ALL HTTP requests:
 //   format!("Zed/{} ({}; {})", AppVersion, std::env::consts::OS, std::env::consts::ARCH)
-// On Windows x64 this is "Zed/1.8.2 (windows; x86_64)". The trial-abuse check
-// rejects requests whose User-Agent isn't a genuine Zed client (curl's default
-// UA triggers trial_blocked), so we must spoof it on every upstream call.
-pub const USER_AGENT = "Zed/" ++ ZED_VERSION ++ " (windows; x86_64)";
+// The OS and architecture must match the build target, just like the real Zed
+// client. The trial-abuse check rejects non-Zed User-Agents such as curl's.
+pub const USER_AGENT = "Zed/" ++ ZED_VERSION ++ " (" ++ @tagName(builtin.os.tag) ++ "; " ++ @tagName(builtin.cpu.arch) ++ ")";
 pub const USER_AGENT_HEADER = "user-agent: " ++ USER_AGENT;
 
 // Global proxy config

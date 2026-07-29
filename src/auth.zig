@@ -8,6 +8,7 @@ pub const Credentials = struct {
 
 // ── Platform constants ──
 const is_windows = builtin.os.tag == .windows;
+const is_macos = builtin.os.tag == .macos;
 
 // ── Windows BCrypt API ──
 const BCRYPT_ALG_HANDLE = *anyopaque;
@@ -345,9 +346,21 @@ pub fn openBrowserPublic(url: []const u8) void {
 fn openBrowser(url: []const u8) void {
     if (comptime is_windows) {
         openBrowserWindows(url);
+    } else if (comptime is_macos) {
+        openBrowserMacOS(url);
     } else {
         openBrowserLinux(url);
     }
+}
+
+fn openBrowserMacOS(url: []const u8) void {
+    const result = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &.{ "/usr/bin/open", url },
+        .max_output_bytes = 256,
+    }) catch return;
+    std.heap.page_allocator.free(result.stdout);
+    std.heap.page_allocator.free(result.stderr);
 }
 
 fn openBrowserWindows(url: []const u8) void {

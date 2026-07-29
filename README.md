@@ -34,7 +34,9 @@ Codex 桌面端（5.6 Sol，极高档位）：
 
 GPT-5.6 思考档位：`none / low / medium / high / xhigh`，不传默认 `xhigh`。`max` 和 `minimal` 这条链路上游不支持，传了直接 400，不会偷偷降级。账号实际有哪些模型以 Zed 返回为准。
 
-## 快速开始（Windows）
+## 快速开始
+
+### Windows
 
 ```powershell
 .\start.ps1                        # 后台启动，127.0.0.1:8001
@@ -44,7 +46,21 @@ GPT-5.6 思考档位：`none / low / medium / high / xhigh`，不传默认 `xhig
 
 管理页：<http://127.0.0.1:8001>
 
-健康检查：
+### macOS
+
+需要 Zig 0.15.x、Node.js/npm，以及系统中的 `openssl` 和 `curl`：
+
+```sh
+(cd webui && npm ci && npm run build)
+zig build -Doptimize=ReleaseSafe
+./zig-out/bin/zed2api login my-account
+./start.sh                         # 后台启动，127.0.0.1:8001
+./stop.sh                          # 停止
+```
+
+`zig build` 会按当前 Mac 原生架构构建，Apple Silicon 和 Intel 均支持。管理页同样是 <http://127.0.0.1:8001>。
+
+Windows 健康检查：
 
 ```powershell
 .\health-check.ps1                # 令牌+账单检查，不调模型
@@ -63,7 +79,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:8001/v1/models'
 
 ### Codex
 
-把 `configs/codex.config.toml.example` 合并进 `%USERPROFILE%\.codex\config.toml`：
+把 `configs/codex.config.toml.example` 合并进 Windows 的 `%USERPROFILE%\.codex\config.toml` 或 macOS 的 `~/.codex/config.toml`：
 
 ```toml
 model_provider = "zed_local"
@@ -87,7 +103,7 @@ codex exec --skip-git-repo-check '请只回复：CODEX_OK'
 
 ### Claude Code
 
-按想用的模型挑一个模板，合并进 `%USERPROFILE%\.claude\settings.json`：
+按想用的模型挑一个模板，合并进 Windows 的 `%USERPROFILE%\.claude\settings.json` 或 macOS 的 `~/.claude/settings.json`：
 
 - `configs/claude.settings.json.example` — Sonnet 5
 - `configs/claude-gpt56-sol / -terra / -luna` — GPT-5.6 变体
@@ -130,13 +146,13 @@ opencode run --model zed-local/gpt-5.6-terra --variant low "你的任务"
 
 需要 Zig 0.15.x：
 
-```powershell
-cd webui && npm ci && npm run build && cd ..   # 前端产物内嵌进 EXE
+```sh
+cd webui && npm ci && npm run build && cd ..   # 前端产物内嵌进可执行文件
 zig build test                                  # 协议转换与流式回归测试
-zig build -Doptimize=ReleaseSafe                # 产物：zig-out\bin\zed2api.exe
+zig build -Doptimize=ReleaseSafe                # Windows: zig-out\bin\zed2api.exe；macOS: zig-out/bin/zed2api
 ```
 
-改了前端记得重新 `zig build`，不然 EXE 里还是旧页面。
+改了前端记得重新 `zig build`，不然可执行文件里还是旧页面。
 
 ## 已知限制
 
