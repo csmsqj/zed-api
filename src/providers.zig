@@ -156,12 +156,39 @@ fn writeAnthropicSystemArrayEntries(w: *std.io.Writer, system: std.json.Value, f
         },
         .array => |items| {
             for (items.items) |item| {
+                // Zed decodes `system` as string-or-text-blocks. A single entry
+                // of any other type fails the whole field ("data did not match
+                // any variant of untagged enum StringOrContents"), so drop it
+                // instead of losing the entire system prompt.
+                if (item == .object) {
+                    const item_type = switch (item.object.get("type") orelse .null) {
+                        .string => |value| value,
+                        else => "",
+                    };
+                    if (!std.mem.eql(u8, item_type, "text")) continue;
+                }
                 if (!first.*) try w.writeAll(",");
                 first.* = false;
                 try std.json.Stringify.value(item, .{}, w);
             }
         },
         else => {},
+    }
+}
+
+/// Write a native Anthropic `system` field, keeping the official string
+/// shorthand and array form (with cache_control) but filtering the array to the
+/// text blocks Zed accepts.
+fn writeAnthropicSystem(w: *std.io.Writer, system: std.json.Value) !void {
+    switch (system) {
+        .array => {
+            try w.writeAll("[");
+            var first = true;
+            try writeAnthropicSystemArrayEntries(w, system, &first);
+            try w.writeAll("]");
+        },
+        .string => try std.json.Stringify.value(system, .{}, w),
+        else => try w.writeAll("[]"),
     }
 }
 
@@ -210,19 +237,149 @@ fn writeMessage(w: *std.io.Writer, msg: std.json.Value) !void {
     try w.writeAll("}");
 }
 
-/// Write Anthropic-native message (passthrough content as-is, including tool_use/tool_result)
-fn writeAnthropicMessage(w: *std.io.Writer, msg: std.json.Value) !void {
-    if (msg != .object) return;
-    const content = msg.object.get("content") orelse return;
-    if (content != .string) {
-        // Array content is already the official Anthropic representation. Keep
-        // tool_use/tool_result/cache_control blocks byte-for-structure intact.
-        try std.json.Stringify.value(msg, .{}, w);
+/// Content-block types Zed's Anthropic parser accepts. An unknown variant
+/// fails the whole request ("unknown variant `document`"), so blocks outside
+/// this set are dropped rather than forwarded.
+///
+/// `thinking` and `redacted_thinking` are deliberately excluded even though the
+/// parser knows them: this upstream route never emits `signature_delta`, so a
+/// replayed thinking block can only ever carry a missing or foreign signature,
+/// which upstream rejects ("Invalid `signature` in `thinking` block"). There is
+/// no signature we could legitimately supply, so history keeps only the text.
+fn isSupportedAnthropicBlock(block_type: []const u8) bool {
+    const supported = [_][]const u8{ "text", "image", "tool_use", "tool_result", "compaction" };
+    for (supported) |candidate| {
+        if (std.mem.eql(u8, block_type, candidate)) return true;
+    }
+    return false;
+}
+
+fn shouldForwardAnthropicBlock(block: std.json.Value) bool {
+    if (block != .object) return true;
+    const block_type = switch (block.object.get("type") orelse .null) {
+        .string => |value| value,
+        else => return false,
+    };
+    return isSupportedAnthropicBlock(block_type);
+}
+
+fn contentHasCompactionBlock(content: std.json.Value) bool {
+    if (content != .array) return false;
+    for (content.array.items) |item| {
+        if (item != .object) continue;
+        const item_type = switch (item.object.get("type") orelse .null) {
+            .string => |value| value,
+            else => continue,
+        };
+        if (std.mem.eql(u8, item_type, "compaction")) return true;
+    }
+    return false;
+}
+
+/// True when any message carries a `compaction` block, which upstream only
+/// accepts alongside a matching `context_management` strategy.
+fn requestHasCompactionBlock(parsed: std.json.Value) bool {
+    const messages = parsed.object.get("messages") orelse return false;
+    if (messages != .array) return false;
+    for (messages.array.items) |message| {
+        if (message != .object) continue;
+        if (contentHasCompactionBlock(message.object.get("content") orelse continue)) return true;
+    }
+    return false;
+}
+
+/// Copy one content block, filling in fields the public Anthropic API treats as
+/// optional but Zed's parser requires. Callers must have accepted the block via
+/// `shouldForwardAnthropicBlock` first.
+fn writeAnthropicBlock(w: *std.io.Writer, block: std.json.Value) !void {
+    if (block != .object) {
+        try std.json.Stringify.value(block, .{}, w);
         return;
     }
+    const block_type = switch (block.object.get("type") orelse .null) {
+        .string => |value| value,
+        else => "",
+    };
+    const is_tool_result = std.mem.eql(u8, block_type, "tool_result");
+    const is_tool_use = std.mem.eql(u8, block_type, "tool_use");
 
-    // Anthropic publicly accepts string shorthand, while Zed's provider parser
-    // requires a sequence of content blocks. Canonicalize only that field.
+    try w.writeAll("{");
+    var first = true;
+    var has_content = false;
+    var has_is_error = false;
+    var has_input = false;
+
+    var it = block.object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        // An explicit null is as fatal as a missing field here ("invalid type:
+        // null, expected a boolean"), so skip it and let the default below fill
+        // the gap.
+        if (is_tool_result and std.mem.eql(u8, key, "is_error") and entry.value_ptr.* == .null) continue;
+
+        if (std.mem.eql(u8, key, "content")) has_content = true;
+        if (std.mem.eql(u8, key, "is_error")) has_is_error = true;
+        if (std.mem.eql(u8, key, "input")) has_input = true;
+
+        if (!first) try w.writeAll(",");
+        first = false;
+        try std.json.Stringify.encodeJsonString(key, .{}, w);
+        try w.writeAll(":");
+        try std.json.Stringify.value(entry.value_ptr.*, .{}, w);
+    }
+
+    // Claude Code omits both fields on successful tool results; Zed requires
+    // them, so a tool loop would otherwise fail on the first result block.
+    if (is_tool_result) {
+        if (!has_content) {
+            if (!first) try w.writeAll(",");
+            first = false;
+            try w.writeAll("\"content\":\"\"");
+        }
+        if (!has_is_error) {
+            if (!first) try w.writeAll(",");
+            first = false;
+            try w.writeAll("\"is_error\":false");
+        }
+    }
+    if (is_tool_use and !has_input) {
+        if (!first) try w.writeAll(",");
+        try w.writeAll("\"input\":{}");
+    }
+    try w.writeAll("}");
+}
+
+/// Write a message `content` value as the block sequence Zed expects: string
+/// shorthand is canonicalized, unsupported blocks are dropped, and required
+/// fields are filled in.
+fn writeAnthropicContentBlocks(w: *std.io.Writer, content: std.json.Value) !void {
+    switch (content) {
+        .string => |text| {
+            try w.writeAll("[{\"type\":\"text\",\"text\":");
+            try std.json.Stringify.encodeJsonString(text, .{}, w);
+            try w.writeAll("}]");
+        },
+        .array => |items| {
+            try w.writeAll("[");
+            var first = true;
+            for (items.items) |item| {
+                if (!shouldForwardAnthropicBlock(item)) continue;
+                if (!first) try w.writeAll(",");
+                first = false;
+                try writeAnthropicBlock(w, item);
+            }
+            try w.writeAll("]");
+        },
+        else => try w.writeAll("[]"),
+    }
+}
+
+/// Write Anthropic-native message. Content blocks are sanitized for Zed's
+/// stricter parser; every other field (role, cache metadata, extras) is kept.
+fn writeAnthropicMessage(w: *std.io.Writer, msg: std.json.Value) !void {
+    if (msg != .object) return;
+    if (msg.object.get("content") == null) return;
+
     try w.writeAll("{");
     var first = true;
     var it = msg.object.iterator();
@@ -232,9 +389,7 @@ fn writeAnthropicMessage(w: *std.io.Writer, msg: std.json.Value) !void {
         try std.json.Stringify.encodeJsonString(entry.key_ptr.*, .{}, w);
         try w.writeAll(":");
         if (std.mem.eql(u8, entry.key_ptr.*, "content")) {
-            try w.writeAll("[{\"type\":\"text\",\"text\":");
-            try std.json.Stringify.encodeJsonString(content.string, .{}, w);
-            try w.writeAll("}]");
+            try writeAnthropicContentBlocks(w, entry.value_ptr.*);
         } else {
             try std.json.Stringify.value(entry.value_ptr.*, .{}, w);
         }
@@ -262,9 +417,13 @@ fn writeMessageWithToolSupport(w: *std.io.Writer, msg: std.json.Value, allocator
         try w.writeAll(",\"content\":");
         switch (content) {
             .string => try std.json.Stringify.encodeJsonString(content.string, .{}, w),
-            else => try std.json.Stringify.value(content, .{}, w),
+            .array => try std.json.Stringify.value(content, .{}, w),
+            // Zed requires `content` to be a string or block array; anything
+            // else (including null) fails the request.
+            else => try w.writeAll("\"\""),
         }
-        try w.writeAll("}]}");
+        // Required by Zed's parser even though the public API defaults it.
+        try w.writeAll(",\"is_error\":false}]}");
         return;
     }
 
@@ -292,37 +451,45 @@ fn writeMessageWithToolSupport(w: *std.io.Writer, msg: std.json.Value, allocator
             // Convert tool_calls to tool_use blocks
             for (tool_calls.?.array.items) |tc| {
                 if (tc != .object) continue;
+                // `id` and `name` are both required upstream; a call missing
+                // either would fail the whole request, so skip it.
+                const call_id = switch (tc.object.get("id") orelse .null) {
+                    .string => |value| value,
+                    else => continue,
+                };
+                const function = tc.object.get("function") orelse continue;
+                if (function != .object) continue;
+                const function_name = switch (function.object.get("name") orelse .null) {
+                    .string => |value| value,
+                    else => continue,
+                };
                 if (wrote_any) try w.writeAll(",");
                 wrote_any = true;
-                try w.writeAll("{\"type\":\"tool_use\"");
-                if (tc.object.get("id")) |id| {
-                    try w.writeAll(",\"id\":");
-                    try std.json.Stringify.value(id, .{}, w);
-                }
-                if (tc.object.get("function")) |func| {
-                    if (func == .object) {
-                        if (func.object.get("name")) |n| {
-                            try w.writeAll(",\"name\":");
-                            try std.json.Stringify.value(n, .{}, w);
-                        }
-                        if (func.object.get("arguments")) |args| {
-                            try w.writeAll(",\"input\":");
-                            if (args == .string) {
-                                // Parse JSON string arguments into object
-                                const parsed_args = std.json.parseFromSlice(std.json.Value, allocator, args.string, .{}) catch {
-                                    try w.writeAll("{}");
-                                    try w.writeAll("}");
-                                    continue;
-                                };
-                                defer parsed_args.deinit();
-                                try std.json.Stringify.value(parsed_args.value, .{}, w);
-                            } else {
-                                try std.json.Stringify.value(args, .{}, w);
-                            }
+                try w.writeAll("{\"type\":\"tool_use\",\"id\":");
+                try std.json.Stringify.encodeJsonString(call_id, .{}, w);
+                try w.writeAll(",\"name\":");
+                try std.json.Stringify.encodeJsonString(function_name, .{}, w);
+                try w.writeAll(",\"input\":");
+                if (function.object.get("arguments")) |args| {
+                    if (args == .string) {
+                        // Zed needs an object here; OpenAI sends a JSON string.
+                        const parsed_args = std.json.parseFromSlice(std.json.Value, allocator, args.string, .{}) catch {
+                            try w.writeAll("{}}");
+                            continue;
+                        };
+                        defer parsed_args.deinit();
+                        if (parsed_args.value == .object) {
+                            try std.json.Stringify.value(parsed_args.value, .{}, w);
                         } else {
-                            try w.writeAll(",\"input\":{}");
+                            try w.writeAll("{}");
                         }
+                    } else if (args == .object) {
+                        try std.json.Stringify.value(args, .{}, w);
+                    } else {
+                        try w.writeAll("{}");
                     }
+                } else {
+                    try w.writeAll("{}");
                 }
                 try w.writeAll("}");
             }
@@ -368,14 +535,108 @@ pub fn buildZedPayload(allocator: std.mem.Allocator, body: []const u8, is_anthro
     return try zed_body.toOwnedSlice();
 }
 
+/// Upstream caps Sonnet 5 output at 128k and rejects anything larger outright.
+const ANTHROPIC_MAX_OUTPUT_TOKENS: i64 = 128000;
+
+/// Zed's Anthropic route rejects sampling knobs Anthropic itself deprecated for
+/// this model class ("`temperature` is deprecated for this model"), so they are
+/// dropped rather than forwarded into a guaranteed 400.
+fn anthropicRejectsSamplingParams(model: []const u8) bool {
+    return std.mem.startsWith(u8, model, "claude-sonnet-5");
+}
+
+/// Anthropic rejects stop sequences that are entirely whitespace. Drop those
+/// entries instead of failing the request.
+fn writeAnthropicStopSequences(w: *std.io.Writer, stop_sequences: std.json.Value) !bool {
+    if (stop_sequences != .array) return false;
+    var kept: usize = 0;
+    for (stop_sequences.array.items) |item| {
+        if (item != .string) continue;
+        if (std.mem.trim(u8, item.string, " \t\r\n").len == 0) continue;
+        if (kept == 0) try w.writeAll("\"stop_sequences\":[");
+        if (kept > 0) try w.writeAll(",");
+        try std.json.Stringify.encodeJsonString(item.string, .{}, w);
+        kept += 1;
+    }
+    if (kept == 0) return false;
+    try w.writeAll("],");
+    return true;
+}
+
+/// Write one native Anthropic tool declaration, supplying the fields Zed's
+/// parser requires but the public API leaves optional.
+fn writeAnthropicTool(w: *std.io.Writer, tool: std.json.Value) !void {
+    try w.writeAll("{");
+    var first = true;
+    var has_description = false;
+    var has_schema = false;
+
+    var it = tool.object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        // `description: null` is rejected the same way a missing one is
+        // ("invalid type: null, expected a string").
+        if (std.mem.eql(u8, key, "description")) {
+            if (entry.value_ptr.* != .string) continue;
+            has_description = true;
+        }
+        if (std.mem.eql(u8, key, "input_schema")) {
+            if (entry.value_ptr.* != .object) continue;
+            has_schema = true;
+        }
+        if (!first) try w.writeAll(",");
+        first = false;
+        try std.json.Stringify.encodeJsonString(key, .{}, w);
+        try w.writeAll(":");
+        try std.json.Stringify.value(entry.value_ptr.*, .{}, w);
+    }
+
+    if (!has_description) {
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.writeAll("\"description\":\"\"");
+    }
+    if (!has_schema) {
+        if (!first) try w.writeAll(",");
+        try w.writeAll("\"input_schema\":{\"type\":\"object\",\"properties\":{}}");
+    }
+    try w.writeAll("}");
+}
+
+/// A tool without a usable name is dropped: upstream fails the entire request
+/// on `missing field \`name\`` rather than ignoring the one bad declaration.
+fn anthropicToolIsUsable(tool: std.json.Value) bool {
+    if (tool != .object) return false;
+    const name = switch (tool.object.get("name") orelse .null) {
+        .string => |value| value,
+        else => return false,
+    };
+    return name.len > 0;
+}
+
+fn writeAnthropicTools(w: *std.io.Writer, tools: std.json.Value) !void {
+    if (tools != .array) {
+        try std.json.Stringify.value(tools, .{}, w);
+        return;
+    }
+    try w.writeAll("[");
+    var first = true;
+    for (tools.array.items) |tool| {
+        if (!anthropicToolIsUsable(tool)) continue;
+        if (!first) try w.writeAll(",");
+        first = false;
+        try writeAnthropicTool(w, tool);
+    }
+    try w.writeAll("]");
+}
+
 fn buildAnthropicRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: std.json.Value, model: []const u8, is_anthropic: bool) !void {
     try w.print("\"model\":\"{s}\",", .{model});
-    if (parsed.object.get("max_tokens")) |mt| {
-        switch (mt) {
-            .integer => |i| try w.print("\"max_tokens\":{d},", .{i}),
-            else => try w.writeAll("\"max_tokens\":8192,"),
-        }
-    } else try w.writeAll("\"max_tokens\":8192,");
+    const max_tokens: i64 = switch (parsed.object.get("max_tokens") orelse std.json.Value{ .null = {} }) {
+        .integer => |value| @min(value, ANTHROPIC_MAX_OUTPUT_TOKENS),
+        else => 8192,
+    };
+    try w.print("\"max_tokens\":{d},", .{max_tokens});
 
     const message_system_text = try collectMessageSystemText(allocator, parsed);
     defer if (message_system_text) |text| allocator.free(text);
@@ -393,10 +654,10 @@ fn buildAnthropicRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed
             try writeAnthropicSystemArrayEntries(w, .{ .string = text }, &first_system_block);
             try w.writeAll("],");
         } else if (parsed.object.get("system")) |system| {
-            // Preserve ordinary native Anthropic requests byte-for-structure,
-            // including cache_control metadata and string shorthand.
+            // Preserve ordinary native Anthropic requests, including
+            // cache_control metadata and string shorthand.
             try w.writeAll("\"system\":");
-            try std.json.Stringify.value(system, .{}, w);
+            try writeAnthropicSystem(w, system);
             try w.writeAll(",");
         }
     } else if (message_system_text) |text| {
@@ -404,10 +665,15 @@ fn buildAnthropicRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed
         try std.json.Stringify.encodeJsonString(text, .{}, w);
         try w.writeAll(",");
     }
-    if (parsed.object.get("temperature")) |temp| {
-        try w.writeAll("\"temperature\":");
-        try std.json.Stringify.value(temp, .{}, w);
-        try w.writeAll(",");
+    if (!anthropicRejectsSamplingParams(model)) {
+        if (parsed.object.get("temperature")) |temp| {
+            try w.writeAll("\"temperature\":");
+            try std.json.Stringify.value(temp, .{}, w);
+            try w.writeAll(",");
+        }
+    }
+    if (parsed.object.get("stop_sequences")) |stop_sequences| {
+        _ = try writeAnthropicStopSequences(w, stop_sequences);
     }
     if (parsed.object.get("thinking")) |thinking| {
         try w.writeAll("\"thinking\":");
@@ -423,13 +689,23 @@ fn buildAnthropicRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed
             try std.json.Stringify.value(output_config, .{}, w);
             try w.writeAll(",");
         }
+        // `compaction` blocks are only accepted alongside a matching strategy,
+        // so forward the client's config and supply the default when a
+        // compacted history arrives without one.
+        if (parsed.object.get("context_management")) |context_management| {
+            try w.writeAll("\"context_management\":");
+            try std.json.Stringify.value(context_management, .{}, w);
+            try w.writeAll(",");
+        } else if (requestHasCompactionBlock(parsed)) {
+            try w.writeAll("\"context_management\":{\"edits\":[{\"type\":\"compact_20260112\"}]},");
+        }
     }
     // Tools support
     if (is_anthropic) {
-        // Anthropic native format: tools already in correct format
+        // Anthropic native format: fill in the fields Zed requires.
         if (parsed.object.get("tools")) |tools| {
             try w.writeAll("\"tools\":");
-            try std.json.Stringify.value(tools, .{}, w);
+            try writeAnthropicTools(w, tools);
             try w.writeAll(",");
         }
         if (parsed.object.get("tool_choice")) |tc| {
@@ -447,18 +723,23 @@ fn buildAnthropicRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed
                     if (tool != .object) continue;
                     const func = tool.object.get("function") orelse continue;
                     if (func != .object) continue;
+                    const name = switch (func.object.get("name") orelse .null) {
+                        .string => |value| value,
+                        else => continue,
+                    };
+                    if (name.len == 0) continue;
                     if (!first) try w.writeAll(",");
                     first = false;
                     try w.writeAll("{\"name\":");
-                    if (func.object.get("name")) |n| try std.json.Stringify.value(n, .{}, w) else try w.writeAll("\"\"");
+                    try std.json.Stringify.encodeJsonString(name, .{}, w);
+                    try w.writeAll(",\"description\":");
                     if (func.object.get("description")) |d| {
-                        try w.writeAll(",\"description\":");
-                        try std.json.Stringify.value(d, .{}, w);
-                    }
+                        if (d == .string) try std.json.Stringify.value(d, .{}, w) else try w.writeAll("\"\"");
+                    } else try w.writeAll("\"\"");
+                    try w.writeAll(",\"input_schema\":");
                     if (func.object.get("parameters")) |p| {
-                        try w.writeAll(",\"input_schema\":");
-                        try std.json.Stringify.value(p, .{}, w);
-                    }
+                        if (p == .object) try std.json.Stringify.value(p, .{}, w) else try w.writeAll("{\"type\":\"object\",\"properties\":{}}");
+                    } else try w.writeAll("{\"type\":\"object\",\"properties\":{}}");
                     try w.writeAll("}");
                 }
                 try w.writeAll("],");
@@ -1551,6 +1832,135 @@ test "native Sonnet 5 merges Claude Code trailing system message" {
     try std.testing.expectEqualStrings("user", messages[0].object.get("role").?.string);
     try std.testing.expectEqualStrings("xhigh", request.get("output_config").?.object.get("effort").?.string);
     try std.testing.expect(request.get("reasoning") == null);
+}
+
+test "Claude Code tool results gain the is_error field Zed requires" {
+    // Zed's Anthropic parser treats `is_error` and `content` as mandatory on
+    // tool_result, while Claude Code omits both on success — the request would
+    // otherwise fail with `missing field \`is_error\``.
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"model":"claude-sonnet-5","max_tokens":1024,"tools":[{"name":"Bash","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":[{"type":"text","text":"ls"}]},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"a.txt"}]}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","is_error":null}]}]}
+    ;
+    const payload = try buildZedPayload(allocator, body, true);
+    defer allocator.free(payload);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const request = parsed.value.object.get("provider_request").?.object;
+    const messages = request.get("messages").?.array.items;
+
+    // tool_use without `input` gets the required empty object.
+    const tool_use = messages[1].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqual(@as(usize, 0), tool_use.get("input").?.object.count());
+
+    // A successful tool_result keeps its content and gains is_error=false.
+    const ok_result = messages[2].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqual(false, ok_result.get("is_error").?.bool);
+    try std.testing.expectEqualStrings("a.txt", ok_result.get("content").?.array.items[0].object.get("text").?.string);
+
+    // An explicit null is replaced, not forwarded, and missing content is filled.
+    const null_result = messages[3].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqual(false, null_result.get("is_error").?.bool);
+    try std.testing.expectEqualStrings("", null_result.get("content").?.string);
+
+    // Tools gain the mandatory description.
+    const tool = request.get("tools").?.array.items[0].object;
+    try std.testing.expectEqualStrings("", tool.get("description").?.string);
+}
+
+test "thinking blocks are dropped because Zed never issues a signature" {
+    // Zed's route emits no signature_delta, so any replayed thinking block is
+    // rejected ("Invalid `signature` in `thinking` block"). Keep only the text.
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"model":"claude-sonnet-5","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning"},{"type":"redacted_thinking","data":"x"},{"type":"text","text":"hello"}]},{"role":"user","content":[{"type":"document","source":{"type":"text","data":"d"}},{"type":"text","text":"ping"}]}]}
+    ;
+    const payload = try buildZedPayload(allocator, body, true);
+    defer allocator.free(payload);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("provider_request").?.object.get("messages").?.array.items;
+
+    const assistant = messages[1].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), assistant.len);
+    try std.testing.expectEqualStrings("text", assistant[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("hello", assistant[0].object.get("text").?.string);
+
+    // `document` is not in Zed's block whitelist either.
+    const user = messages[2].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), user.len);
+    try std.testing.expectEqualStrings("ping", user[0].object.get("text").?.string);
+}
+
+test "deprecated sampling params and oversized budgets are corrected" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"model":"claude-sonnet-5","max_tokens":1000000,"temperature":0.7,"top_p":0.9,"stop_sequences":["\n\n","END"],"system":[{"type":"text","text":"keep"},{"type":"tool_use","id":"x","name":"y"}],"messages":[{"role":"user","content":"ping"}]}
+    ;
+    const payload = try buildZedPayload(allocator, body, true);
+    defer allocator.free(payload);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const request = parsed.value.object.get("provider_request").?.object;
+
+    // `temperature`/`top_p` are deprecated for this model and rejected upstream.
+    try std.testing.expect(request.get("temperature") == null);
+    try std.testing.expect(request.get("top_p") == null);
+    // 128k is upstream's hard ceiling.
+    try std.testing.expectEqual(@as(i64, 128000), request.get("max_tokens").?.integer);
+    // Whitespace-only stop sequences are rejected; the valid one survives.
+    const stops = request.get("stop_sequences").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), stops.len);
+    try std.testing.expectEqualStrings("END", stops[0].string);
+    // A non-text system block would fail the whole `system` field.
+    const system = request.get("system").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), system.len);
+    try std.testing.expectEqualStrings("keep", system[0].object.get("text").?.string);
+}
+
+test "compaction history gets the strategy upstream demands" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"model":"claude-sonnet-5","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"compaction","text":"summary"}]},{"role":"user","content":"ping"}]}
+    ;
+    const payload = try buildZedPayload(allocator, body, true);
+    defer allocator.free(payload);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const request = parsed.value.object.get("provider_request").?.object;
+    const edits = request.get("context_management").?.object.get("edits").?.array.items;
+    try std.testing.expectEqualStrings("compact_20260112", edits[0].object.get("type").?.string);
+}
+
+test "OpenAI tool history converts to Anthropic blocks Zed accepts" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"model":"claude-sonnet-5","tools":[{"type":"function","function":{"name":"Bash","parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"ls"},{"role":"assistant","tool_calls":[{"id":"call_1","function":{"name":"Bash","arguments":"{\"command\":\"ls\"}"}},{"function":{"name":"NoId","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_1","content":"a.txt"}]}
+    ;
+    const payload = try buildZedPayload(allocator, body, false);
+    defer allocator.free(payload);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const request = parsed.value.object.get("provider_request").?.object;
+
+    // A tool declaration without a description would fail the request.
+    try std.testing.expectEqualStrings("", request.get("tools").?.array.items[0].object.get("description").?.string);
+
+    const messages = request.get("messages").?.array.items;
+    const assistant = messages[1].object.get("content").?.array.items;
+    // The call missing an `id` is dropped rather than failing everything.
+    try std.testing.expectEqual(@as(usize, 1), assistant.len);
+    try std.testing.expectEqualStrings("call_1", assistant[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("ls", assistant[0].object.get("input").?.object.get("command").?.string);
+
+    const tool_result = messages[2].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqual(false, tool_result.get("is_error").?.bool);
+    try std.testing.expectEqualStrings("a.txt", tool_result.get("content").?.string);
 }
 
 test "OpenAI system and developer messages become Anthropic top-level system" {
