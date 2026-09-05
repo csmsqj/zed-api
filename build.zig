@@ -68,7 +68,24 @@ pub fn build(b: *std.Build) void {
     }
     const run_stream_tests = b.addRunArtifact(stream_tests);
 
+    // Upstream status-message handling lives here: Zed reports rejected
+    // requests as HTTP 200 plus a `status.failed` line, so the parser that
+    // recognizes them needs its own coverage.
+    const proxy_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/proxy.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const proxy_tests = b.addTest(.{ .root_module = proxy_test_mod });
+    if (target.result.os.tag == .windows) {
+        proxy_tests.root_module.linkSystemLibrary("advapi32", .{});
+        proxy_tests.root_module.linkSystemLibrary("ws2_32", .{});
+    }
+    const run_proxy_tests = b.addRunArtifact(proxy_tests);
+
     const test_step = b.step("test", "Run protocol and streaming regression tests");
     test_step.dependOn(&run_providers_tests.step);
     test_step.dependOn(&run_stream_tests.step);
+    test_step.dependOn(&run_proxy_tests.step);
 }
