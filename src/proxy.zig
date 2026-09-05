@@ -127,6 +127,101 @@ pub fn errorForStatus(status: []const u8, body: []const u8) anyerror {
     return error.UpstreamError;
 }
 
+/// Because we advertise `x-zed-client-supports-status-messages`, Zed reports a
+/// rejected or failed request as HTTP **200** plus a single
+/// `{"status":{"failed":{...}}}` line — for example `upstream_http_400` when a
+/// parameter is deprecated, or `unknown` during a provider outage. Without
+/// parsing it, such a response looks like a successful stream that simply
+/// contained no text: the caller returned 200 with an empty assistant turn and
+/// the account stayed marked healthy.
+pub const UpstreamFailure = struct {
+    /// Upstream HTTP status parsed out of `code` (e.g. `upstream_http_400`),
+    /// or 0 when the code is not status-shaped (e.g. `unknown`).
+    status: u16 = 0,
+    /// Upstream supplied a retry hint, i.e. a throttle rather than a request
+    /// that will fail the same way forever.
+    rate_limited: bool = false,
+};
+
+/// Parse one upstream line as a failure status message. Returns null for
+/// ordinary events and for the `{"status":"stream_ended"}` completion marker.
+pub fn parseUpstreamFailure(line: []const u8, allocator: std.mem.Allocator) ?UpstreamFailure {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const status = parsed.value.object.get("status") orelse return null;
+    if (status != .object) return null;
+    const failed = status.object.get("failed") orelse return null;
+    if (failed != .object) return null;
+
+    var result: UpstreamFailure = .{};
+    if (failed.object.get("code")) |code| {
+        if (code == .string) {
+            const prefix = "upstream_http_";
+            if (std.mem.startsWith(u8, code.string, prefix)) {
+                result.status = std.fmt.parseInt(u16, code.string[prefix.len..], 10) catch 0;
+            }
+        }
+    }
+    if (failed.object.get("retry_after")) |retry_after| {
+        if (retry_after != .null) result.rate_limited = true;
+    }
+    if (result.status == 429) result.rate_limited = true;
+    return result;
+}
+
+/// Scan a fully buffered upstream body (one JSON object per line) for a failure
+/// status message. Used by the non-streaming paths, which would otherwise
+/// convert the failure into an empty 200 response.
+pub fn findUpstreamFailure(body: []const u8, allocator: std.mem.Allocator) ?UpstreamFailure {
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] != '{') continue;
+        if (std.mem.indexOf(u8, line, "\"failed\"") == null) continue;
+        if (parseUpstreamFailure(line, allocator)) |failure| return failure;
+    }
+    return null;
+}
+
+fn errorForUpstreamFailure(failure: UpstreamFailure) anyerror {
+    if (failure.rate_limited) return error.RateLimited;
+    return switch (failure.status) {
+        401, 403 => error.TokenExpired,
+        else => error.UpstreamError,
+    };
+}
+
+test "upstream failure status messages are parsed" {
+    const allocator = std.testing.allocator;
+
+    const rejected = parseUpstreamFailure(
+        "{\"status\":{\"failed\":{\"code\":\"upstream_http_400\",\"message\":\"`temperature` is deprecated\",\"retry_after\":null}}}",
+        allocator,
+    ).?;
+    try std.testing.expectEqual(@as(u16, 400), rejected.status);
+    try std.testing.expect(!rejected.rate_limited);
+    try std.testing.expectEqual(error.UpstreamError, errorForUpstreamFailure(rejected));
+
+    const throttled = parseUpstreamFailure("{\"status\":{\"failed\":{\"code\":\"upstream_http_429\",\"retry_after\":30}}}", allocator).?;
+    try std.testing.expect(throttled.rate_limited);
+    try std.testing.expectEqual(error.RateLimited, errorForUpstreamFailure(throttled));
+
+    const unauthorized = parseUpstreamFailure("{\"status\":{\"failed\":{\"code\":\"upstream_http_401\"}}}", allocator).?;
+    try std.testing.expectEqual(error.TokenExpired, errorForUpstreamFailure(unauthorized));
+
+    // Ordinary traffic and the completion marker must not look like failures.
+    try std.testing.expect(parseUpstreamFailure("{\"status\":\"stream_ended\"}", allocator) == null);
+    try std.testing.expect(parseUpstreamFailure("{\"event\":{\"type\":\"response.created\"}}", allocator) == null);
+
+    // A failure buried mid-stream is still found.
+    const body =
+        "{\"event\":{\"type\":\"response.created\"}}\n" ++
+        "{\"status\":{\"failed\":{\"code\":\"unknown\",\"message\":\"boom\"}}}\n";
+    try std.testing.expectEqual(@as(u16, 0), findUpstreamFailure(body, allocator).?.status);
+    try std.testing.expect(findUpstreamFailure("{\"event\":{\"type\":\"ping\"}}\n", allocator) == null);
+}
+
 /// Send HTTP POST via proxy using curl subprocess
 pub fn sendViaProxy(allocator: std.mem.Allocator, bearer: []const u8, body: []const u8) ![]const u8 {
     const p_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ proxy_host.?, proxy_port });
@@ -217,6 +312,16 @@ pub fn sendViaProxy(allocator: std.mem.Allocator, bearer: []const u8, body: []co
         return error.UpstreamError;
     }
 
+    // An HTTP 200 whose body carries a `status.failed` line is a rejection, not
+    // a completion. Surfacing it as an error keeps the caller from returning an
+    // empty but successful-looking response.
+    if (findUpstreamFailure(response_body, allocator)) |failure| {
+        std.debug.print("[zed] upstream rejected request (status={d}): {s}\n", .{ failure.status, response_body[0..@min(response_body.len, 500)] });
+        const e = errorForUpstreamFailure(failure);
+        allocator.free(result.stdout);
+        return e;
+    }
+
     const owned = allocator.dupe(u8, response_body) catch {
         allocator.free(result.stdout);
         return error.UpstreamError;
@@ -263,6 +368,12 @@ pub fn sendToZed(allocator: std.mem.Allocator, jwt: []const u8, body: []const u8
             };
 
             if (fetch_result.status == .ok) {
+                // Same HTTP-200 rejection check as the proxied path.
+                if (findUpstreamFailure(response_buf.written(), allocator)) |failure| {
+                    std.debug.print("[zed] upstream rejected request (status={d}): {s}\n", .{ failure.status, response_buf.written()[0..@min(response_buf.written().len, 500)] });
+                    response_buf.deinit();
+                    break :blk @as(anyerror![]const u8, errorForUpstreamFailure(failure));
+                }
                 break :blk @as(anyerror![]const u8, response_buf.toOwnedSlice() catch {
                     response_buf.deinit();
                     break :blk @as(anyerror![]const u8, error.UpstreamError);

@@ -151,6 +151,27 @@ fn shouldRetryEmptyStream(result: StreamResult, retries_used: usize) bool {
         retries_used < EMPTY_STREAM_RETRY_LIMIT;
 }
 
+/// A rejected request (upstream 400/404/422) fails identically on every
+/// account, so trying the rest only burns quota and latency. Auth and
+/// rate-limit failures are account-level and still worth failing over.
+fn shouldTryNextAccount(result: StreamResult) bool {
+    return switch (result.status) {
+        400, 404, 405, 413, 422 => false,
+        else => true,
+    };
+}
+
+test "request-level rejections do not fan out across accounts" {
+    try std.testing.expect(!shouldTryNextAccount(.{ .ok = false, .status = 400 }));
+    try std.testing.expect(!shouldTryNextAccount(.{ .ok = false, .status = 422 }));
+    // Account-level and ambiguous failures must still fail over.
+    try std.testing.expect(shouldTryNextAccount(.{ .ok = false, .status = 401 }));
+    try std.testing.expect(shouldTryNextAccount(.{ .ok = false, .status = 403 }));
+    try std.testing.expect(shouldTryNextAccount(.{ .ok = false, .status = 429 }));
+    try std.testing.expect(shouldTryNextAccount(.{ .ok = false, .status = 500 }));
+    try std.testing.expect(shouldTryNextAccount(.{ .ok = false, .status = 0 }));
+}
+
 /// Handle streaming proxy with account failover
 pub fn handleStreamProxy(
     client_stream: std.net.Stream,
@@ -196,6 +217,13 @@ pub fn handleStreamProxy(
                 continue;
             }
 
+            // A malformed request is our fault, not the account's: don't bench a
+            // healthy account and don't replay the same rejection elsewhere.
+            if (!shouldTryNextAccount(res)) {
+                std.debug.print("[zed2api] stream: request rejected upstream (status={d}); not failing over\n", .{res.status});
+                break;
+            }
+
             accounts.AccountManager.markFailure(acc, res.kind, res.status);
             std.debug.print("[zed2api] stream: account '{s}' failed (kind={s}, status={d}, benched {d}s)\n", .{ acc.name, @tagName(res.kind), res.status, @max(acc.disabled_until - std.time.timestamp(), 0) });
 
@@ -204,6 +232,7 @@ pub fn handleStreamProxy(
             if (res.committed) return;
             break;
         }
+        if (!shouldTryNextAccount(last)) break;
     }
 
     const code: u16 = if (last.status != 0) last.status else 502;
@@ -393,6 +422,16 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
                         line_len = 0;
                         continue;
                     }
+                    // A `status.failed` line is an HTTP 200 rejection. Report it
+                    // as a failure so the request can fail over instead of
+                    // returning an empty but successful-looking turn.
+                    if (std.mem.indexOf(u8, line, "\"failed\"") != null) {
+                        if (proxy.parseUpstreamFailure(line, allocator)) |failure| {
+                            std.debug.print("[stream] upstream rejected request (status={d}): {s}\n", .{ failure.status, line[0..@min(line.len, 500)] });
+                            if (std.mem.indexOf(u8, line, "plan") != null) saw_plan_error = true;
+                            return resultForUpstreamFailure(failure, headers_sent);
+                        }
+                    }
                     if (!headers_sent) {
                         headers_sent = true;
                         // This server handles one request per TCP connection and
@@ -508,6 +547,47 @@ fn isStreamEndedMarker(line: []const u8, allocator: std.mem.Allocator) bool {
     if (parsed.value != .object) return false;
     const status = parsed.value.object.get("status") orelse return false;
     return status == .string and std.mem.eql(u8, status.string, "stream_ended");
+}
+
+fn resultForUpstreamFailure(failure: proxy.UpstreamFailure, committed: bool) StreamResult {
+    const kind: accounts.FailureKind = if (failure.rate_limited)
+        .rate_limit
+    else switch (failure.status) {
+        401, 403 => .auth,
+        else => .transient,
+    };
+    return .{
+        .ok = false,
+        .committed = committed,
+        .kind = kind,
+        .status = if (failure.status != 0) failure.status else 502,
+    };
+}
+
+test "upstream failure status messages map to failover decisions" {
+    const allocator = std.testing.allocator;
+
+    const rejected = proxy.parseUpstreamFailure(
+        "{\"status\":{\"failed\":{\"code\":\"upstream_http_400\",\"message\":\"`temperature` is deprecated\",\"retry_after\":null}}}",
+        allocator,
+    ).?;
+    const rejected_result = resultForUpstreamFailure(rejected, false);
+    try std.testing.expectEqual(accounts.FailureKind.transient, rejected_result.kind);
+    try std.testing.expectEqual(@as(u16, 400), rejected_result.status);
+    // A rejected request must not be replayed against the other accounts.
+    try std.testing.expect(!shouldTryNextAccount(rejected_result));
+
+    const throttled = proxy.parseUpstreamFailure("{\"status\":{\"failed\":{\"code\":\"upstream_http_429\",\"retry_after\":30}}}", allocator).?;
+    try std.testing.expectEqual(accounts.FailureKind.rate_limit, resultForUpstreamFailure(throttled, false).kind);
+
+    const unauthorized = proxy.parseUpstreamFailure("{\"status\":{\"failed\":{\"code\":\"upstream_http_401\"}}}", allocator).?;
+    try std.testing.expectEqual(accounts.FailureKind.auth, resultForUpstreamFailure(unauthorized, false).kind);
+
+    // An outage reports no HTTP status; it stays retryable on another account.
+    const unknown = proxy.parseUpstreamFailure("{\"status\":{\"failed\":{\"code\":\"unknown\",\"message\":\"boom\"}}}", allocator).?;
+    const unknown_result = resultForUpstreamFailure(unknown, false);
+    try std.testing.expectEqual(@as(u16, 502), unknown_result.status);
+    try std.testing.expect(shouldTryNextAccount(unknown_result));
 }
 
 test "stream-ended marker is matched structurally" {
