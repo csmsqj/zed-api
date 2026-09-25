@@ -1272,21 +1272,17 @@ fn writeOutputBudget(w: *std.io.Writer, parsed: std.json.Value, model: []const u
         const budget = if (requested) |value| @max(value, GPT_REASONING_OUTPUT_FLOOR) else GPT_REASONING_OUTPUT_FLOOR;
         try w.print(",\"max_output_tokens\":{d}", .{budget});
     } else if (requested) |value| {
-        // Zed's OpenAI upstream (the OpenAI Responses API) rejects a
-        // `max_output_tokens` below 16 outright ("Invalid 'max_output_tokens':
-        // integer below minimum value. Expected a value >= 16"). Because we
-        // advertise status messages, that rejection comes back as an HTTP 200
-        // `status.failed` line and surfaces to every account as an "upstream
-        // error" (上游异常). Clamp a smaller client/probe budget up to the floor
-        // instead of forwarding a value the upstream is guaranteed to reject.
-        try w.print(",\"max_output_tokens\":{d}", .{@max(value, GPT_MIN_OUTPUT_TOKENS)});
+        // Zed's OpenAI upstream rejects `max_output_tokens` below 16 outright.
+        // Keep a modest local safety margin above that observed boundary so
+        // lightweight client and probe budgets do not sit on the exact limit.
+        try w.print(",\"max_output_tokens\":{d}", .{@max(value, GPT_OUTPUT_TOKEN_SAFETY_FLOOR)});
     }
 }
 
-/// Zed's OpenAI provider forwards to the OpenAI Responses API, which rejects a
-/// `max_output_tokens` below 16 ("Expected a value >= 16"). Clamp up to it so a
-/// small client budget never turns into a hard upstream rejection.
-const GPT_MIN_OUTPUT_TOKENS: i64 = 16;
+/// Zed's OpenAI provider forwards to the OpenAI Responses API, whose observed
+/// minimum is 16 output tokens. Use twice that boundary as the local floor.
+const GPT_UPSTREAM_MIN_OUTPUT_TOKENS: i64 = 16;
+const GPT_OUTPUT_TOKEN_SAFETY_FLOOR: i64 = GPT_UPSTREAM_MIN_OUTPUT_TOKENS * 2;
 
 fn buildOpenAIRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: std.json.Value, model: []const u8, is_anthropic: bool) !void {
     // Codex already sends OpenAI Responses input. Preserve its request shape
@@ -2702,20 +2698,23 @@ pub fn convertToAnthropic(allocator: std.mem.Allocator, response: []const u8, mo
     return try result.toOwnedSlice();
 }
 
-test "GPT output budget is clamped up to the upstream minimum of 16" {
+test "GPT output budget uses a safety floor above the upstream minimum" {
     const allocator = std.testing.allocator;
-    // Zed's OpenAI upstream rejects max_output_tokens < 16 ("Expected a value
-    // >= 16"); a smaller client/probe budget must be raised to the floor rather
-    // than forwarded verbatim and rejected as an "upstream error".
-    const small =
-        \\{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none","max_completion_tokens":4}
-    ;
-    const payload = try buildZedPayload(allocator, small, false);
-    defer allocator.free(payload);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
-    defer parsed.deinit();
-    const req = parsed.value.object.get("provider_request").?.object;
-    try std.testing.expectEqual(@as(i64, 16), req.get("max_output_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 32), GPT_OUTPUT_TOKEN_SAFETY_FLOOR);
+    try std.testing.expect(GPT_OUTPUT_TOKEN_SAFETY_FLOOR > GPT_UPSTREAM_MIN_OUTPUT_TOKENS);
+
+    // Cover the original failing budget, the observed upstream boundary, and
+    // the value immediately below our safety floor.
+    for ([_]i64{ 4, 16, 31 }) |budget| {
+        var body_buf: [256]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "{{\"model\":\"gpt-5.6-luna\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"reasoning_effort\":\"none\",\"max_completion_tokens\":{d}}}", .{budget});
+        const payload = try buildZedPayload(allocator, body, false);
+        defer allocator.free(payload);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        const req = parsed.value.object.get("provider_request").?.object;
+        try std.testing.expectEqual(GPT_OUTPUT_TOKEN_SAFETY_FLOOR, req.get("max_output_tokens").?.integer);
+    }
 }
 
 test "GPT output budget above the minimum is forwarded unchanged" {
