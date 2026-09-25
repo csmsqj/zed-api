@@ -11,12 +11,13 @@ const web_ui = @embedFile("web_index_html");
 
 // Explicit health probes are intentionally tiny. Passive quota checks never
 // invoke a model; when the user asks for a real inference check, use the
-// lowest project model tier, disable reasoning, and cap visible output.
+// lowest project model tier, disable reasoning, and keep a modest margin above
+// the upstream's observed 16-token output minimum.
 const HEALTH_PROBE_MODEL = "gpt-5.6-luna";
 const HEALTH_PROBE_EFFORT = "none";
-const HEALTH_PROBE_MAX_OUTPUT_TOKENS: i64 = 16;
+const HEALTH_PROBE_MAX_OUTPUT_TOKENS: i64 = 32;
 const HEALTH_PROBE_BODY =
-    \\{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"Reply only OK"}],"reasoning_effort":"none","max_completion_tokens":16,"stream":false}
+    \\{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"Reply only OK"}],"reasoning_effort":"none","max_completion_tokens":32,"stream":false}
 ;
 
 var account_mgr: accounts.AccountManager = undefined;
@@ -775,4 +776,14 @@ fn handleLoginStatus() Response {
             break :blk .{ .status = 200, .body = "{\"status\":\"failed\"}" };
         },
     };
+}
+
+test "health probe payload matches its advertised safety budget" {
+    try std.testing.expect(HEALTH_PROBE_MAX_OUTPUT_TOKENS > 16);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, HEALTH_PROBE_BODY, .{});
+    defer parsed.deinit();
+    const body = parsed.value.object;
+    try std.testing.expectEqualStrings(HEALTH_PROBE_MODEL, body.get("model").?.string);
+    try std.testing.expectEqualStrings(HEALTH_PROBE_EFFORT, body.get("reasoning_effort").?.string);
+    try std.testing.expectEqual(HEALTH_PROBE_MAX_OUTPUT_TOKENS, body.get("max_completion_tokens").?.integer);
 }
