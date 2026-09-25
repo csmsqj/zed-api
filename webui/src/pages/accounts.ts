@@ -97,7 +97,7 @@ function healthPresentation(status: AccountQuotaStatus | undefined, accountName:
     return {
       className: 'checking',
       label: '正在实测',
-      detail: '仅使用 gpt-5.6-luna、none 推理档位和最多 16 个输出 Token',
+      detail: '仅使用 gpt-5.6-luna、none 推理档位和最多 32 个输出 Token',
     }
   }
 
@@ -407,7 +407,7 @@ export function renderAccounts() {
 
     <div class="notice-banner">
       <span>${icons.shield}</span>
-      <p><strong>检测成本说明</strong>：令牌、套餐和额度检查不会调用模型；账号实测只会对每个选中账号调用一次 gpt-5.6-luna，使用 none 推理档位、短提示词和最多 16 个输出 Token，不会轮流检测其他模型。</p>
+      <p><strong>检测成本说明</strong>：令牌、套餐和额度检查不会调用模型；账号实测只会对每个选中账号调用一次 gpt-5.6-luna，使用 none 推理档位、短提示词和最多 32 个输出 Token，不会轮流检测其他模型。</p>
     </div>
 
     <div class="metric-grid" id="account-overview"></div>
