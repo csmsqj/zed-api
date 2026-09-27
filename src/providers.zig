@@ -2703,9 +2703,10 @@ test "GPT output budget uses a safety floor above the upstream minimum" {
     try std.testing.expectEqual(@as(i64, 32), GPT_OUTPUT_TOKEN_SAFETY_FLOOR);
     try std.testing.expect(GPT_OUTPUT_TOKEN_SAFETY_FLOOR > GPT_UPSTREAM_MIN_OUTPUT_TOKENS);
 
-    // Cover the original failing budget, the observed upstream boundary, and
-    // the value immediately below our safety floor.
-    for ([_]i64{ 4, 16, 31 }) |budget| {
+    // Cover the original failing budget, the observed upstream boundary, the
+    // value immediately below our safety floor, the floor itself, and the
+    // degenerate zero or negative budgets some clients emit.
+    for ([_]i64{ -5, 0, 4, 16, 31, 32 }) |budget| {
         var body_buf: [256]u8 = undefined;
         const body = try std.fmt.bufPrint(&body_buf, "{{\"model\":\"gpt-5.6-luna\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"reasoning_effort\":\"none\",\"max_completion_tokens\":{d}}}", .{budget});
         const payload = try buildZedPayload(allocator, body, false);
@@ -2728,4 +2729,20 @@ test "GPT output budget above the minimum is forwarded unchanged" {
     defer parsed.deinit();
     const req = parsed.value.object.get("provider_request").?.object;
     try std.testing.expectEqual(@as(i64, 2000), req.get("max_output_tokens").?.integer);
+}
+
+test "Anthropic GPT small budgets take the reasoning floor, not the upstream minimum" {
+    const allocator = std.testing.allocator;
+    // Claude Code's /v1/messages GPT route pins effort to xhigh, so a tiny
+    // `max_tokens` is lifted to the large reasoning floor and can never reach
+    // the upstream below its observed 16-token minimum.
+    const small =
+        \\{"model":"gpt-5.6-sol","max_tokens":4,"messages":[{"role":"user","content":"hi"}]}
+    ;
+    const payload = try buildZedPayload(allocator, small, true);
+    defer allocator.free(payload);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const req = parsed.value.object.get("provider_request").?.object;
+    try std.testing.expectEqual(GPT_REASONING_OUTPUT_FLOOR, req.get("max_output_tokens").?.integer);
 }
