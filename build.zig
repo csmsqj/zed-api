@@ -41,9 +41,8 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zed2api server");
     run_step.dependOn(&run_cmd.step);
 
-    // Keep protocol conversion and streaming behavior executable through the
-    // standard `zig build test` command. These two modules contain the request
-    // compatibility and SSE regression tests used by Codex/Claude Code.
+    // Keep request conversion, streaming, upstream status parsing, and health
+    // probe behavior executable through the standard `zig build test` command.
     const providers_test_mod = b.createModule(.{
         .root_source_file = b.path("src/providers.zig"),
         .target = target,
@@ -84,8 +83,34 @@ pub fn build(b: *std.Build) void {
     }
     const run_proxy_tests = b.addRunArtifact(proxy_tests);
 
-    const test_step = b.step("test", "Run protocol and streaming regression tests");
+    const server_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    // `zig build test` must also run on a fresh clone where the generated
+    // webui/dist/index.html does not exist yet: it is produced by `npm run
+    // build` and never committed. Tests never read the page, so substitute a
+    // placeholder file; the executable above still requires the real artifact.
+    var server_web_index: std.Build.LazyPath = b.path("webui/dist/index.html");
+    b.build_root.handle.access("webui/dist/index.html", .{}) catch {
+        const placeholder = b.addWriteFiles();
+        server_web_index = placeholder.add("index.html", "<!doctype html><title>zed2api</title>");
+    };
+    server_test_mod.addAnonymousImport("web_index_html", .{ .root_source_file = server_web_index });
+    const server_tests = b.addTest(.{ .root_module = server_test_mod });
+    if (target.result.os.tag == .windows) {
+        server_tests.root_module.linkSystemLibrary("bcrypt", .{});
+        server_tests.root_module.linkSystemLibrary("advapi32", .{});
+        server_tests.root_module.linkSystemLibrary("crypt32", .{});
+        server_tests.root_module.linkSystemLibrary("ws2_32", .{});
+    }
+    const run_server_tests = b.addRunArtifact(server_tests);
+
+    const test_step = b.step("test", "Run protocol, streaming, and health regression tests");
     test_step.dependOn(&run_providers_tests.step);
     test_step.dependOn(&run_stream_tests.step);
     test_step.dependOn(&run_proxy_tests.step);
+    test_step.dependOn(&run_server_tests.step);
 }

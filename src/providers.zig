@@ -1272,9 +1272,17 @@ fn writeOutputBudget(w: *std.io.Writer, parsed: std.json.Value, model: []const u
         const budget = if (requested) |value| @max(value, GPT_REASONING_OUTPUT_FLOOR) else GPT_REASONING_OUTPUT_FLOOR;
         try w.print(",\"max_output_tokens\":{d}", .{budget});
     } else if (requested) |value| {
-        try w.print(",\"max_output_tokens\":{d}", .{value});
+        // Zed's OpenAI upstream rejects `max_output_tokens` below 16 outright.
+        // Keep a modest local safety margin above that observed boundary so
+        // lightweight client and probe budgets do not sit on the exact limit.
+        try w.print(",\"max_output_tokens\":{d}", .{@max(value, GPT_OUTPUT_TOKEN_SAFETY_FLOOR)});
     }
 }
+
+/// Zed's OpenAI provider forwards to the OpenAI Responses API, whose observed
+/// minimum is 16 output tokens. Use twice that boundary as the local floor.
+const GPT_UPSTREAM_MIN_OUTPUT_TOKENS: i64 = 16;
+const GPT_OUTPUT_TOKEN_SAFETY_FLOOR: i64 = GPT_UPSTREAM_MIN_OUTPUT_TOKENS * 2;
 
 fn buildOpenAIRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: std.json.Value, model: []const u8, is_anthropic: bool) !void {
     // Codex already sends OpenAI Responses input. Preserve its request shape
@@ -2016,6 +2024,42 @@ test "non-streaming Responses returns official completed envelope" {
     try std.testing.expectEqualStrings("ok", parsed.value.object.get("output").?.array.items[0].object.get("content").?.array.items[0].object.get("text").?.string);
 }
 
+test "Chat Completions recovers visible text from a delta-less completed envelope" {
+    const allocator = std.testing.allocator;
+    // A reasoning-capable model can finish a tiny turn without emitting any
+    // `response.output_text.delta`; the answer lives only in the completed
+    // envelope. The probe must still see visible text here.
+    const upstream =
+        \\{"event":{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK","annotations":[]}]}]}}}
+        \\{"status":"stream_ended"}
+    ;
+    const output = try convertToOpenAI(allocator, upstream, "gpt-5.6-luna");
+    defer allocator.free(output);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, output, .{});
+    defer parsed.deinit();
+    const content = parsed.value.object.get("choices").?.array.items[0].object.get("message").?.object.get("content").?;
+    try std.testing.expectEqualStrings("OK", content.string);
+}
+
+test "Chat Completions keeps streamed delta text without duplicating the completed envelope" {
+    const allocator = std.testing.allocator;
+    // When deltas already carried the text, the completed-envelope fallback
+    // must not append it a second time.
+    const upstream =
+        \\{"event":{"type":"response.output_text.delta","delta":"OK"}}
+        \\{"event":{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}]}}}
+        \\{"status":"stream_ended"}
+    ;
+    const output = try convertToOpenAI(allocator, upstream, "gpt-5.6-luna");
+    defer allocator.free(output);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, output, .{});
+    defer parsed.deinit();
+    const content = parsed.value.object.get("choices").?.array.items[0].object.get("message").?.object.get("content").?;
+    try std.testing.expectEqualStrings("OK", content.string);
+}
+
 fn buildGoogleRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: std.json.Value, model: []const u8, is_anthropic: bool) !void {
     try w.print("\"model\":\"models/{s}\",", .{model});
 
@@ -2411,6 +2455,14 @@ pub fn extractContentFromStream(allocator: std.mem.Allocator, response: []const 
     if (current_tool_id) |id| allocator.free(id);
     if (current_tool_name) |name| allocator.free(name);
 
+    // A short or reasoning-truncated turn can arrive with no `output_text.delta`
+    // events even though the authoritative completed envelope carries the text.
+    // Only consult it when the incremental stream yielded nothing, so normal
+    // streamed answers are never double-counted.
+    if (text_buf.written().len == 0) {
+        appendCompletedOutputText(allocator, response, &text_buf) catch {};
+    }
+
     const text = try text_buf.toOwnedSlice();
     const think_written = think_buf.written();
     const tool_written = tool_buf.written();
@@ -2430,6 +2482,61 @@ pub fn extractContentFromStream(allocator: std.mem.Allocator, response: []const 
     tool_buf.deinit();
 
     return .{ .thinking = thinking, .text = text, .tool_calls = tool_calls };
+}
+
+/// Recover visible assistant text from the authoritative `response.completed`
+/// envelope. Zed normally streams text as `response.output_text.delta` events,
+/// but a very short or reasoning-truncated turn can carry the final answer only
+/// in the completed envelope with no deltas at all. Falling back to it keeps a
+/// healthy account from being misread as an empty (`upstream_error`) probe.
+fn appendCompletedOutputText(allocator: std.mem.Allocator, response: []const u8, out: *std.io.Writer.Allocating) !void {
+    var lines = std.mem.splitScalar(u8, response, '\n');
+    while (lines.next()) |raw_line| {
+        var line = std.mem.trim(u8, raw_line, " \t\r");
+        if (std.mem.startsWith(u8, line, "data:")) line = std.mem.trim(u8, line[5..], " \t");
+        if (line.len == 0 or line[0] != '{') continue;
+
+        const p = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer p.deinit();
+        if (p.value != .object) continue;
+
+        const event = if (p.value.object.get("event")) |e|
+            (if (e == .object) e else p.value)
+        else
+            p.value;
+        if (event != .object) continue;
+        const event_type = switch (event.object.get("type") orelse continue) {
+            .string => |s| s,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, event_type, "response.completed")) continue;
+
+        const resp = event.object.get("response") orelse continue;
+        if (resp != .object) continue;
+        const output = resp.object.get("output") orelse continue;
+        if (output != .array) continue;
+        for (output.array.items) |item| {
+            if (item != .object) continue;
+            const it_type = switch (item.object.get("type") orelse continue) {
+                .string => |s| s,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, it_type, "message")) continue;
+            const content = item.object.get("content") orelse continue;
+            if (content != .array) continue;
+            for (content.array.items) |block| {
+                if (block != .object) continue;
+                const b_type = switch (block.object.get("type") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                if (!std.mem.eql(u8, b_type, "output_text")) continue;
+                if (block.object.get("text")) |t| {
+                    if (t == .string) try out.writer.writeAll(t.string);
+                }
+            }
+        }
+    }
 }
 
 pub fn convertToOpenAI(allocator: std.mem.Allocator, response: []const u8, model: []const u8) ![]const u8 {
@@ -2589,4 +2696,53 @@ pub fn convertToAnthropic(allocator: std.mem.Allocator, response: []const u8, mo
     const stop_reason = if (sc.tool_calls != null) "tool_use" else "end_turn";
     try w.print("],\"stop_reason\":\"{s}\"}}", .{stop_reason});
     return try result.toOwnedSlice();
+}
+
+test "GPT output budget uses a safety floor above the upstream minimum" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(i64, 32), GPT_OUTPUT_TOKEN_SAFETY_FLOOR);
+    try std.testing.expect(GPT_OUTPUT_TOKEN_SAFETY_FLOOR > GPT_UPSTREAM_MIN_OUTPUT_TOKENS);
+
+    // Cover the original failing budget, the observed upstream boundary, the
+    // value immediately below our safety floor, the floor itself, and the
+    // degenerate zero or negative budgets some clients emit.
+    for ([_]i64{ -5, 0, 4, 16, 31, 32 }) |budget| {
+        var body_buf: [256]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "{{\"model\":\"gpt-5.6-luna\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"reasoning_effort\":\"none\",\"max_completion_tokens\":{d}}}", .{budget});
+        const payload = try buildZedPayload(allocator, body, false);
+        defer allocator.free(payload);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        const req = parsed.value.object.get("provider_request").?.object;
+        try std.testing.expectEqual(GPT_OUTPUT_TOKEN_SAFETY_FLOOR, req.get("max_output_tokens").?.integer);
+    }
+}
+
+test "GPT output budget above the minimum is forwarded unchanged" {
+    const allocator = std.testing.allocator;
+    const big =
+        \\{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none","max_completion_tokens":2000}
+    ;
+    const payload = try buildZedPayload(allocator, big, false);
+    defer allocator.free(payload);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const req = parsed.value.object.get("provider_request").?.object;
+    try std.testing.expectEqual(@as(i64, 2000), req.get("max_output_tokens").?.integer);
+}
+
+test "Anthropic GPT small budgets take the reasoning floor, not the upstream minimum" {
+    const allocator = std.testing.allocator;
+    // Claude Code's /v1/messages GPT route pins effort to xhigh, so a tiny
+    // `max_tokens` is lifted to the large reasoning floor and can never reach
+    // the upstream below its observed 16-token minimum.
+    const small =
+        \\{"model":"gpt-5.6-sol","max_tokens":4,"messages":[{"role":"user","content":"hi"}]}
+    ;
+    const payload = try buildZedPayload(allocator, small, true);
+    defer allocator.free(payload);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const req = parsed.value.object.get("provider_request").?.object;
+    try std.testing.expectEqual(GPT_REASONING_OUTPUT_FLOOR, req.get("max_output_tokens").?.integer);
 }
